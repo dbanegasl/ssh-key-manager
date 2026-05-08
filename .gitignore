@@ -1,0 +1,18 @@
+# Configuración local con datos del usuario — NUNCA subir al repo
+config.local.sh
+*.local
+
+# Claves privadas (por si acaso)
+*.pem
+*.key
+id_*
+!id_*.pub
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+*.swp
+*~
