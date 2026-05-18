@@ -22,6 +22,7 @@ WIN_PRIV=""
 WSL_KEY=""
 WSL_PRIV=""
 WIN_PRIV_TMP="/tmp/ssh_km_win_$$"
+WIN_KEY_TMP="/tmp/ssh_km_win_pub_$$.pub"
 WIN_AVAIL=0
 
 # --- Colores ---
@@ -38,13 +39,14 @@ NC='\033[0m'
 SUCCESS=()
 SKIPPED=()
 FAILED=()
+PARTIAL=()
 HOSTS=()
 HOSTS_DISPLAY=()
 
 # =============================================================================
 # Limpieza al salir
 # =============================================================================
-cleanup() { rm -f "$WIN_PRIV_TMP"; }
+cleanup() { rm -f "$WIN_PRIV_TMP" "$WIN_KEY_TMP"; }
 trap cleanup EXIT
 
 # =============================================================================
@@ -281,9 +283,32 @@ preflight_checks() {
         echo -e "  ${YELLOW}[WARN]${NC} Llave Windows no encontrada: $WIN_KEY"
         echo -e "         ${DIM}(solo se instalará la llave WSL)${NC}"
     else
-        cp "$WIN_PRIV" "$WIN_PRIV_TMP" && chmod 600 "$WIN_PRIV_TMP"
-        WIN_AVAIL=1
-        echo -e "  ${GREEN}[OK]${NC}   Llave Windows: $WIN_KEY"
+        # Copiar AMBOS archivos a /tmp con permisos correctos
+        if ! cp "$WIN_PRIV" "$WIN_PRIV_TMP" 2>/dev/null; then
+            echo -e "  ${RED}[FAIL]${NC} No se pudo copiar llave privada de Windows"
+            ok=0
+        elif ! cp "$WIN_KEY" "$WIN_KEY_TMP" 2>/dev/null; then
+            echo -e "  ${RED}[FAIL]${NC} No se pudo copiar llave pública de Windows"
+            ok=0
+        else
+            # Convertir CRLF → LF (problema común con claves de Windows)
+            dos2unix "$WIN_PRIV_TMP" 2>/dev/null || sed -i 's/\r$//' "$WIN_PRIV_TMP"
+            dos2unix "$WIN_KEY_TMP" 2>/dev/null || sed -i 's/\r$//' "$WIN_KEY_TMP"
+            
+            # Establecer permisos correctos
+            chmod 600 "$WIN_PRIV_TMP"
+            chmod 644 "$WIN_KEY_TMP"
+            
+            # Validar que la clave sea válida (usar .pub — no requiere passphrase)
+            if ssh-keygen -l -f "$WIN_KEY_TMP" >/dev/null 2>&1; then
+                WIN_AVAIL=1
+                echo -e "  ${GREEN}[OK]${NC}   Llave Windows: $WIN_KEY (copiada y procesada)"
+            else
+                echo -e "  ${RED}[FAIL]${NC} Llave Windows inválida o corrupta"
+                echo -e "         Verifica el archivo: $WIN_KEY"
+                ok=0
+            fi
+        fi
     fi
 
     if [[ ! -f "$HOME/.ssh/config" ]]; then
@@ -387,8 +412,14 @@ install_key() {
             echo -e "${CYAN}ya instalada${NC}"; win_skip=1
         else
             echo -e "${YELLOW}instalando...${NC}"
-            ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
-                -o ServerAliveInterval=10 -i "$WIN_KEY" "$alias"
+            # Verificar que el archivo temporal todavía existe (puede haberse limpiado)
+            if [[ ! -f "$WIN_KEY_TMP" ]]; then
+                cp "$WIN_KEY" "$WIN_KEY_TMP" 2>/dev/null && \
+                { dos2unix "$WIN_KEY_TMP" 2>/dev/null || sed -i 's/\r$//' "$WIN_KEY_TMP"; } && \
+                chmod 644 "$WIN_KEY_TMP"
+            fi
+            ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout="$CONNECT_TIMEOUT" \
+                -o ServerAliveInterval=10 -i "$WIN_KEY_TMP" "$alias"
             r_win=$?
             [[ $r_win -eq 0 ]] \
                 && echo -e "  ${BLUE}[WIN]${NC} ${GREEN}Instalada correctamente${NC}" \
@@ -413,20 +444,22 @@ install_key() {
     fi
 
     # Clasificar resultado
-    local fail=0
-    [[ $WIN_AVAIL -eq 1 && $r_win -ne 0 ]] && fail=1
-    [[ $r_wsl -ne 0 ]] && fail=1
+    local win_ok=1 wsl_ok=1
+    [[ $WIN_AVAIL -eq 1 && $r_win -ne 0 ]] && win_ok=0
+    [[ $r_wsl -ne 0 ]] && wsl_ok=0
 
-    if [[ $fail -eq 0 ]]; then
-        if [[ $win_skip -eq 1 && $wsl_skip -eq 1 ]]; then
-            SKIPPED+=("$alias")
-        else
-            SUCCESS+=("$alias")
-        fi
-    else
-        local detail=" [win=${r_win} wsl=${r_wsl}]"
-        [[ $WIN_AVAIL -eq 0 ]] && detail=" [wsl=${r_wsl}]"
+    if [[ $wsl_ok -eq 0 ]]; then
+        # WSL falló → fallo real
+        local detail=" [wsl=${r_wsl}]"
+        [[ $WIN_AVAIL -eq 1 ]] && detail=" [win=${r_win} wsl=${r_wsl}]"
         FAILED+=("${alias}${detail}")
+    elif [[ $WIN_AVAIL -eq 1 && $win_ok -eq 0 ]]; then
+        # WSL OK pero WIN falló → parcial
+        PARTIAL+=("$alias  ${DIM}[WIN no instalada]${NC}")
+    elif [[ $win_skip -eq 1 && $wsl_skip -eq 1 ]]; then
+        SKIPPED+=("$alias")
+    else
+        SUCCESS+=("$alias")
     fi
 }
 
@@ -434,7 +467,7 @@ install_key() {
 # Resumen final
 # =============================================================================
 print_summary() {
-    local total=$(( ${#SUCCESS[@]} + ${#SKIPPED[@]} + ${#FAILED[@]} ))
+    local total=$(( ${#SUCCESS[@]} + ${#SKIPPED[@]} + ${#PARTIAL[@]} + ${#FAILED[@]} ))
     echo ""
     echo -e "  ${BOLD}╔══════════════════════════════════════════╗${NC}"
     echo -e "  ${BOLD}║           RESUMEN  FINAL                 ║${NC}"
@@ -448,11 +481,15 @@ print_summary() {
     for s in "${SKIPPED[@]}"; do echo -e "    ${CYAN}↷${NC} $s"; done
 
     echo ""
+    printf "  ${YELLOW}WSL ok / WIN falló (%d)${NC}\n" "${#PARTIAL[@]}"
+    for p in "${PARTIAL[@]}"; do echo -e "    ${YELLOW}~${NC} $p"; done
+
+    echo ""
     printf "  ${RED}Fallidas           (%d)${NC}\n" "${#FAILED[@]}"
     for f in "${FAILED[@]}"; do echo -e "    ${RED}✗${NC} $f"; done
 
     echo ""
-    echo -e "  Total: ${BOLD}${total}${NC}  |  ${GREEN}${#SUCCESS[@]} nuevas${NC}  ${CYAN}${#SKIPPED[@]} skip${NC}  ${RED}${#FAILED[@]} fallo${NC}"
+    echo -e "  Total: ${BOLD}${total}${NC}  |  ${GREEN}${#SUCCESS[@]} nuevas${NC}  ${CYAN}${#SKIPPED[@]} skip${NC}  ${YELLOW}${#PARTIAL[@]} parcial${NC}  ${RED}${#FAILED[@]} fallo${NC}"
     echo ""
 }
 
@@ -555,7 +592,102 @@ show_config() {
     [[ -f "$WIN_KEY" ]] && win_exists="${GREEN}existe${NC}" || win_exists="${RED}no encontrada${NC}"
     [[ -f "$WSL_KEY" ]] && wsl_exists="${GREEN}existe${NC}" || wsl_exists="${RED}no encontrada${NC}"
     echo -e "    WIN .pub : ${win_exists}    WSL .pub : ${wsl_exists}"
+    
+    if [[ $WIN_AVAIL -eq 1 ]]; then
+        echo -e "\n    ${BLUE}[WIN]${NC} Llave privada procesada y disponible en memoria"
+    fi
     echo ""
+}
+
+# =============================================================================
+# Reparar permisos SSH en servidores remotos
+# =============================================================================
+fix_ssh_permissions() {
+    local targets=()
+
+    echo -e "\n  ${BOLD}¿En qué servidores aplicar la reparación?${NC}"
+    echo -e "  ${DIM}Corrige: permisos del home, ~/.ssh/ y deduplica authorized_keys${NC}\n"
+    echo -e "    ${CYAN}1)${NC}  Todos los servidores  ${DIM}(${#HOSTS[@]} hosts)${NC}"
+    echo -e "    ${CYAN}2)${NC}  Seleccionar servidores"
+    echo -ne "\n  Opción: "
+    read -r sub
+
+    if [[ "$sub" == "1" ]]; then
+        for entry in "${HOSTS[@]}"; do targets+=("${entry%%|*}"); done
+    elif [[ "$sub" == "2" ]]; then
+        SELECTED_INDEXES=()
+        pick_servers
+        for idx in "${SELECTED_INDEXES[@]}"; do
+            (( idx >= 1 && idx <= ${#HOSTS[@]} )) && targets+=("${HOSTS[$((idx-1))]%%|*}")
+        done
+    else
+        echo -e "  ${YELLOW}Cancelado.${NC}"; return
+    fi
+
+    [[ ${#targets[@]} -eq 0 ]] && echo -e "  ${YELLOW}No se seleccionó ningún servidor.${NC}" && return
+
+    # Script remoto: corregir permisos y deduplicar authorized_keys
+    local remote_cmd
+    remote_cmd=$(cat <<'REMOTE'
+result=""
+# Permisos del home
+home_perm=$(stat -c "%a" ~ 2>/dev/null)
+if (( (8#$home_perm & 8#020) != 0 )); then
+    chmod g-w ~ && result+="home:corregido($home_perm→$(stat -c '%a' ~)) "
+else
+    result+="home:ok($home_perm) "
+fi
+# Permisos de ~/.ssh
+chmod 700 ~/.ssh 2>/dev/null && result+="ssh_dir:ok "
+# Permisos de authorized_keys
+if [[ -f ~/.ssh/authorized_keys ]]; then
+    chmod 600 ~/.ssh/authorized_keys
+    before=$(wc -l < ~/.ssh/authorized_keys)
+    sort -u ~/.ssh/authorized_keys > /tmp/.ak_dedup_$$ && mv /tmp/.ak_dedup_$$ ~/.ssh/authorized_keys
+    after=$(wc -l < ~/.ssh/authorized_keys)
+    result+="keys:${before}→${after}unicas"
+else
+    result+="keys:no_existe"
+fi
+echo "$result"
+REMOTE
+)
+
+    echo ""
+    printf "  ${BOLD}  %-44s %-14s %s${NC}\n" "Alias" "Auth" "Resultado"
+    echo -e "  ${DIM}  ──────────────────────────────────────────   ─────────────  ─────────────────────────${NC}"
+
+    local fixed=0 failed=0
+    for alias in "${targets[@]}"; do
+        printf "  ${CYAN}  %-44s${NC}" "$alias"
+
+        # Intentar con llave WSL (sin contraseña)
+        local out
+        if out=$(timeout 12 ssh \
+                -i "$WSL_PRIV" \
+                -o BatchMode=yes \
+                -o StrictHostKeyChecking=no \
+                -o ConnectTimeout="$CONNECT_TIMEOUT" \
+                "$alias" "$remote_cmd" 2>/dev/null); then
+            echo -e "${DIM}llave${NC}     ${GREEN}${out}${NC}"
+            (( fixed++ )) || true
+        else
+            # Fallback: contraseña (interactivo)
+            echo -e "${YELLOW}contraseña${NC}"
+            if ssh \
+                    -o StrictHostKeyChecking=no \
+                    -o ConnectTimeout=15 \
+                    "$alias" "$remote_cmd"; then
+                (( fixed++ )) || true
+            else
+                echo -e "    ${RED}✗ No se pudo conectar${NC}"
+                (( failed++ )) || true
+            fi
+        fi
+    done
+
+    echo ""
+    echo -e "  ${BOLD}Resultado:${NC}  ${GREEN}${fixed} reparados${NC}  ${RED}${failed} fallidos${NC}\n"
 }
 
 # =============================================================================
@@ -572,12 +704,13 @@ main_menu() {
         echo -e "    ${CYAN}4)${NC}  ${BOLD}Verificar estado${NC} WIN/WSL ${DIM}(dry-run)${NC}"
         echo -e "    ${CYAN}5)${NC}  Ver configuración activa"
         echo -e "    ${CYAN}6)${NC}  ${YELLOW}Reconfigurar${NC} ${DIM}(lanzar wizard)${NC}"
+        echo -e "    ${CYAN}7)${NC}  ${BOLD}Reparar permisos SSH${NC} ${DIM}(home, ~/.ssh, dedup keys)${NC}"
         echo -e "    ${CYAN}0)${NC}  Salir"
         echo ""
         echo -ne "  Opción: "
         read -r opt
 
-        SUCCESS=(); SKIPPED=(); FAILED=()
+        SUCCESS=(); SKIPPED=(); FAILED=(); PARTIAL=()
 
         case "$opt" in
             1)
@@ -611,12 +744,13 @@ main_menu() {
                 parse_config
                 preflight_checks
                 ;;
+            7) fix_ssh_permissions ;;
             0)
                 echo -e "\n  ${GREEN}Hasta luego.${NC}\n"
                 exit 0
                 ;;
             *)
-                echo -e "\n  ${RED}Opción inválida. Usa 0-6.${NC}"
+                echo -e "\n  ${RED}Opción inválida. Usa 0-7.${NC}"
                 ;;
         esac
     done
