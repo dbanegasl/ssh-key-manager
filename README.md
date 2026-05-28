@@ -1,11 +1,13 @@
-# SSH Key Manager
+# SSH Key Manager (`skm`)
 
-Script interactivo para instalar llaves SSH (Windows + WSL) en múltiples
-servidores definidos en `~/.ssh/config`.
+Script interactivo para instalar llaves SSH en múltiples servidores definidos
+en `~/.ssh/config`. Compatible con **macOS, Linux y WSL (Windows)**.
 
 ## Características
 
-- Instala simultáneamente la llave **Windows** (`/mnt/c/...`) y la llave **WSL**
+- Detecta la plataforma automáticamente (macOS / Linux / WSL)
+- En WSL: instala simultáneamente la llave **Windows** (`/mnt/c/...`) y la llave **local**
+- En macOS/Linux: instala la llave local directamente
 - Lee hosts, IPs y puertos directamente desde `~/.ssh/config` (sin duplicar datos)
 - Detecta si la llave ya está instalada antes de intentar copiarla
 - Verifica conectividad TCP antes de cada conexión
@@ -15,15 +17,15 @@ servidores definidos en `~/.ssh/config`.
 
 ## Requisitos
 
-- Bash 4+
+- Bash 3.2+ (compatible con el bash del sistema en macOS)
 - `ssh-copy-id` disponible
 - Hosts configurados en `~/.ssh/config` con `User` definido
 
 ## Uso
 
 ```bash
-chmod +x ssh-key-manager.sh
-./ssh-key-manager.sh
+chmod +x skm
+./skm
 ```
 
 ## Configuración
@@ -49,7 +51,7 @@ cp config.example.sh config.local.sh
 
 ```bash
 # config.local.sh
-WIN_USERNAME="tu-usuario-windows"   # C:\Users\<este valor>
+WIN_USERNAME="tu-usuario-windows"   # solo en WSL: C:\Users\<este valor>
 KEY_NAME="vsCODE"                   # nombre del archivo de llave (sin .pub)
 SSH_USER="tu-usuario-ssh"           # valor de User= en ~/.ssh/config
 CONNECT_TIMEOUT=8
@@ -63,7 +65,7 @@ Desde el menú del script, usa la opción **6 → Reconfigurar**.
 
 ```
 ssh-key-manager/
-├── ssh-key-manager.sh    # Script principal
+├── skm                   # Script principal
 ├── config.example.sh     # Plantilla de configuración (comprometer en git)
 ├── config.local.sh       # Tu configuración real (gitignored, NO subir)
 ├── README.md
@@ -77,7 +79,7 @@ ssh-key-manager/
 | `1` | Instalar en **todos** los servidores del config |
 | `2` | Seleccionar servidores por número o rango |
 | `3` | Listar todos los servidores configurados |
-| `4` | Verificar estado WIN/WSL por servidor (dry-run) |
+| `4` | Verificar estado de llaves por servidor (dry-run) |
 | `5` | Ver configuración activa |
 | `6` | Reconfigurar (relanzar wizard) |
 | `0` | Salir |

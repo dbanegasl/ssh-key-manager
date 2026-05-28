@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
 # =============================================================================
-# SSH Key Manager — Windows + WSL  v3.0
+# SSH Key Manager  v3.1
 # Instala llaves SSH en múltiples servidores definidos en ~/.ssh/config
+# Compatible con macOS, Linux y WSL (Windows)
 # Configuración externa en config.local.sh (nunca se sube al repo)
 # =============================================================================
 
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# =============================================================================
+# Detectar plataforma: macos | wsl | linux
+# =============================================================================
+detect_platform() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        PLATFORM="macos"
+    elif grep -qi microsoft /proc/version 2>/dev/null; then
+        PLATFORM="wsl"
+    else
+        PLATFORM="linux"
+    fi
+}
+detect_platform
 CONFIG_FILE="$SCRIPT_DIR/config.local.sh"
 
 # Variables de configuración (se cargan desde config.local.sh)
@@ -24,6 +39,9 @@ WSL_PRIV=""
 WIN_PRIV_TMP="/tmp/ssh_km_win_$$"
 WIN_KEY_TMP="/tmp/ssh_km_win_pub_$$.pub"
 WIN_AVAIL=0
+
+# Plataforma detectada al inicio (macos | wsl | linux)
+PLATFORM="linux"
 
 # --- Colores ---
 RED='\033[0;31m'
@@ -121,7 +139,7 @@ setup_wizard() {
         echo -e "  Usuario detectado: ${GREEN}${chosen_win_user}${NC}"
         echo -ne "  ¿Correcto? [S/n]: "
         read -r confirm
-        if [[ "${confirm,,}" == "n" ]]; then
+        if [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" == "n" ]]; then
             echo -ne "  Ingresa tu usuario de Windows: "
             read -r chosen_win_user
         fi
@@ -197,7 +215,7 @@ setup_wizard() {
         echo -e "  Usuario detectado: ${GREEN}${chosen_ssh_user}${NC}"
         echo -ne "  ¿Correcto? [S/n]: "
         read -r confirm
-        if [[ "${confirm,,}" == "n" ]]; then
+        if [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" == "n" ]]; then
             echo -ne "  Ingresa tu usuario SSH: "
             read -r chosen_ssh_user
         fi
@@ -229,7 +247,7 @@ setup_wizard() {
     echo -ne "\n  ¿Guardar configuración? [S/n]: "
     read -r confirm
 
-    if [[ "${confirm,,}" == "n" ]]; then
+    if [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" == "n" ]]; then
         echo -e "\n  ${YELLOW}Configuración cancelada.${NC}\n"
         return 1
     fi
@@ -327,37 +345,45 @@ preflight_checks() {
 
 # =============================================================================
 # Parsear ~/.ssh/config — extrae hosts filtrando por SSH_USER
+# Usa ssh -G para obtener hostname/puerto reales (respeta HostName, herencia, etc.)
 # =============================================================================
 parse_config() {
     local config="$HOME/.ssh/config"
-    local cur_alias="" cur_hostname="" cur_port="22" cur_user=""
+    local cur_aliases="" cur_user=""
 
     _flush() {
-        if [[ -n "$cur_alias" && "$cur_user" == "$SSH_USER" && -n "$cur_hostname" ]]; then
-            HOSTS+=("${cur_alias}|${cur_hostname}|${cur_port}")
-            HOSTS_DISPLAY+=("$(printf "%-42s \033[2m%s:%s\033[0m" "$cur_alias" "$cur_hostname" "$cur_port")")
-        fi
+        [[ -z "$cur_aliases" || "$cur_user" != "$SSH_USER" ]] && return
+        local alias
+        for alias in $cur_aliases; do
+            [[ "$alias" == "*" ]] && continue
+            # ssh -G resuelve hostname y puerto efectivos según toda la config
+            local real_hostname real_port
+            real_hostname=$(ssh -G "$alias" 2>/dev/null | awk '/^hostname / {print $2}')
+            real_port=$(ssh -G "$alias" 2>/dev/null | awk '/^port / {print $2}')
+            [[ -z "$real_hostname" ]] && real_hostname="$alias"
+            [[ -z "$real_port" ]]    && real_port="22"
+            HOSTS+=("${alias}|${real_hostname}|${real_port}")
+            HOSTS_DISPLAY+=("$(printf "%-42s \033[2m%s:%s\033[0m" "$alias" "$real_hostname" "$real_port")")
+        done
     }
 
     while IFS= read -r line; do
         local key val
         read -r key val <<< "$line"
-        case "${key,,}" in
-            host)     _flush; cur_alias="$val"; cur_hostname=""; cur_port="22"; cur_user="" ;;
-            hostname) cur_hostname="$val" ;;
-            port)     cur_port="$val"     ;;
-            user)     cur_user="$val"     ;;
+        case "$(echo "$key" | tr '[:upper:]' '[:lower:]')" in
+            host) _flush; cur_aliases="$val"; cur_user="" ;;
+            user) cur_user="$val" ;;
         esac
     done < "$config"
     _flush
 }
 
 # =============================================================================
-# Verificar conectividad TCP
+# Verificar conectividad TCP (compatible macOS: usa nc en lugar de timeout)
 # =============================================================================
 check_port() {
     local host="$1" port="$2"
-    timeout "$CONNECT_TIMEOUT" bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null
+    nc -z -w "$CONNECT_TIMEOUT" "$host" "$port" 2>/dev/null
 }
 
 # =============================================================================
@@ -365,11 +391,13 @@ check_port() {
 # =============================================================================
 key_installed() {
     local priv="$1" alias="$2"
-    timeout 12 ssh \
+    ssh \
         -i "$priv" \
         -o BatchMode=yes \
         -o StrictHostKeyChecking=no \
         -o ConnectTimeout="$CONNECT_TIMEOUT" \
+        -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=1 \
         "$alias" exit 2>/dev/null
 }
 
@@ -405,32 +433,39 @@ install_key() {
     fi
     echo -e "${GREEN}OK${NC}"
 
-    # Llave Windows
-    if [[ $WIN_AVAIL -eq 1 ]]; then
-        echo -ne "  ${BLUE}[WIN]${NC} Verificando... "
-        if key_installed "$WIN_PRIV_TMP" "$alias"; then
-            echo -e "${CYAN}ya instalada${NC}"; win_skip=1
-        else
-            echo -e "${YELLOW}instalando...${NC}"
-            # Verificar que el archivo temporal todavía existe (puede haberse limpiado)
-            if [[ ! -f "$WIN_KEY_TMP" ]]; then
-                cp "$WIN_KEY" "$WIN_KEY_TMP" 2>/dev/null && \
-                { dos2unix "$WIN_KEY_TMP" 2>/dev/null || sed -i 's/\r$//' "$WIN_KEY_TMP"; } && \
-                chmod 644 "$WIN_KEY_TMP"
+    # Llave Windows (solo en WSL)
+    if [[ "$PLATFORM" == "wsl" ]]; then
+        if [[ $WIN_AVAIL -eq 1 ]]; then
+            echo -ne "  ${BLUE}[WIN]${NC} Verificando... "
+            if key_installed "$WIN_PRIV_TMP" "$alias"; then
+                echo -e "${CYAN}ya instalada${NC}"; win_skip=1
+            else
+                echo -e "${YELLOW}instalando...${NC}"
+                if [[ ! -f "$WIN_KEY_TMP" ]]; then
+                    cp "$WIN_KEY" "$WIN_KEY_TMP" 2>/dev/null && \
+                    { dos2unix "$WIN_KEY_TMP" 2>/dev/null || sed -i 's/\r$//' "$WIN_KEY_TMP"; } && \
+                    chmod 644 "$WIN_KEY_TMP"
+                fi
+                ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout="$CONNECT_TIMEOUT" \
+                    -o ServerAliveInterval=10 -i "$WIN_KEY_TMP" "$alias"
+                r_win=$?
+                [[ $r_win -eq 0 ]] \
+                    && echo -e "  ${BLUE}[WIN]${NC} ${GREEN}Instalada correctamente${NC}" \
+                    || echo -e "  ${BLUE}[WIN]${NC} ${RED}Error (código $r_win)${NC}"
             fi
-            ssh-copy-id -o StrictHostKeyChecking=no -o ConnectTimeout="$CONNECT_TIMEOUT" \
-                -o ServerAliveInterval=10 -i "$WIN_KEY_TMP" "$alias"
-            r_win=$?
-            [[ $r_win -eq 0 ]] \
-                && echo -e "  ${BLUE}[WIN]${NC} ${GREEN}Instalada correctamente${NC}" \
-                || echo -e "  ${BLUE}[WIN]${NC} ${RED}Error (código $r_win)${NC}"
+        else
+            echo -e "  ${BLUE}[WIN]${NC} ${DIM}Omitida (llave no disponible)${NC}"
         fi
-    else
-        echo -e "  ${BLUE}[WIN]${NC} ${DIM}Omitida (llave no disponible)${NC}"
     fi
 
-    # Llave WSL
-    echo -ne "  ${GREEN}[WSL]${NC} Verificando... "
+    # Llave LOCAL (macOS / Linux / WSL)
+    local label_local
+    case "$PLATFORM" in
+        macos) label_local="${GREEN}[MAC]${NC}"   ;;
+        wsl)   label_local="${GREEN}[WSL]${NC}"   ;;
+        *)     label_local="${GREEN}[LOCAL]${NC}" ;;
+    esac
+    echo -ne "  ${label_local} Verificando... "
     if key_installed "$WSL_PRIV" "$alias"; then
         echo -e "${CYAN}ya instalada${NC}"; wsl_skip=1
     else
@@ -439,8 +474,8 @@ install_key() {
             -o ServerAliveInterval=10 -i "$WSL_KEY" "$alias"
         r_wsl=$?
         [[ $r_wsl -eq 0 ]] \
-            && echo -e "  ${GREEN}[WSL]${NC} ${GREEN}Instalada correctamente${NC}" \
-            || echo -e "  ${GREEN}[WSL]${NC} ${RED}Error (código $r_wsl)${NC}"
+            && echo -e "  ${label_local} ${GREEN}Instalada correctamente${NC}" \
+            || echo -e "  ${label_local} ${RED}Error (código $r_wsl)${NC}"
     fi
 
     # Clasificar resultado
@@ -449,13 +484,11 @@ install_key() {
     [[ $r_wsl -ne 0 ]] && wsl_ok=0
 
     if [[ $wsl_ok -eq 0 ]]; then
-        # WSL falló → fallo real
-        local detail=" [wsl=${r_wsl}]"
-        [[ $WIN_AVAIL -eq 1 ]] && detail=" [win=${r_win} wsl=${r_wsl}]"
+        local detail=" [local=${r_wsl}]"
+        [[ $WIN_AVAIL -eq 1 ]] && detail=" [win=${r_win} local=${r_wsl}]"
         FAILED+=("${alias}${detail}")
     elif [[ $WIN_AVAIL -eq 1 && $win_ok -eq 0 ]]; then
-        # WSL OK pero WIN falló → parcial
-        PARTIAL+=("$alias  ${DIM}[WIN no instalada]${NC}")
+        PARTIAL+=("$alias  ${DIM}[WIN no instalada - macOS/Linux no aplica]${NC}")
     elif [[ $win_skip -eq 1 && $wsl_skip -eq 1 ]]; then
         SKIPPED+=("$alias")
     else
@@ -520,7 +553,7 @@ pick_servers() {
 
     SELECTED_INDEXES=()
 
-    if [[ "${selection,,}" == "all" ]]; then
+    if [[ "$(echo "$selection" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
         for (( i=1; i<=${#HOSTS[@]}; i++ )); do SELECTED_INDEXES+=("$i"); done
         return
     fi
@@ -543,7 +576,11 @@ check_status() {
     echo ""
     echo -e "  ${BOLD}Estado de llaves en ${#HOSTS[@]} servidores...${NC}"
     echo -e "  ${DIM}(puede tardar según cantidad de hosts)${NC}\n"
-    printf "  ${BOLD}  #   %-42s  %-10s  %-10s${NC}\n" "Alias" "WIN" "WSL"
+    if [[ "$PLATFORM" == "wsl" ]]; then
+        printf "  ${BOLD}  #   %-42s  %-10s  %-10s${NC}\n" "Alias" "WIN" "WSL"
+    else
+        printf "  ${BOLD}  #   %-42s  %-10s${NC}\n" "Alias" "LOCAL"
+    fi
     echo -e "  ${DIM}  ─   ──────────────────────────────────────  ──────────  ──────────${NC}"
 
     local i=1
@@ -559,15 +596,21 @@ check_status() {
             echo -e "${RED}sin conexión${NC}"
         else
             local win_st wsl_st
-            if [[ $WIN_AVAIL -eq 1 ]]; then
-                key_installed "$WIN_PRIV_TMP" "$alias" 2>/dev/null \
-                    && win_st="${GREEN}✓ OK      ${NC}" || win_st="${RED}✗ NO      ${NC}"
-            else
-                win_st="${DIM}n/a       ${NC}"
-            fi
+            local local_st
             key_installed "$WSL_PRIV" "$alias" 2>/dev/null \
-                && wsl_st="${GREEN}✓ OK${NC}" || wsl_st="${RED}✗ NO${NC}"
-            echo -e "${win_st}  ${wsl_st}"
+                && local_st="${GREEN}✓ OK${NC}" || local_st="${RED}✗ NO${NC}"
+            if [[ "$PLATFORM" == "wsl" ]]; then
+                local win_st
+                if [[ $WIN_AVAIL -eq 1 ]]; then
+                    key_installed "$WIN_PRIV_TMP" "$alias" 2>/dev/null \
+                        && win_st="${GREEN}✓ OK      ${NC}" || win_st="${RED}✗ NO      ${NC}"
+                else
+                    win_st="${DIM}n/a       ${NC}"
+                fi
+                echo -e "${win_st}  ${local_st}"
+            else
+                echo -e "${local_st}"
+            fi
         fi
         (( i++ )) || true
     done
@@ -580,7 +623,8 @@ check_status() {
 show_config() {
     echo ""
     echo -e "  ${BOLD}Configuración activa${NC}  ${DIM}(${CONFIG_FILE})${NC}\n"
-    echo -e "    Usuario Windows : ${CYAN}${WIN_USERNAME}${NC}"
+    echo -e "    Plataforma      : ${CYAN}${PLATFORM}${NC}"
+    echo -e "    Usuario Windows : ${CYAN}${WIN_USERNAME:-n/a (macOS/Linux)}${NC}"
     echo -e "    Nombre de llave : ${CYAN}${KEY_NAME}${NC}"
     echo -e "    Usuario SSH     : ${CYAN}${SSH_USER}${NC}"
     echo -e "    Timeout         : ${CYAN}${CONNECT_TIMEOUT}s${NC}"
@@ -663,11 +707,13 @@ REMOTE
 
         # Intentar con llave WSL (sin contraseña)
         local out
-        if out=$(timeout 12 ssh \
+        if out=$(ssh \
                 -i "$WSL_PRIV" \
                 -o BatchMode=yes \
                 -o StrictHostKeyChecking=no \
                 -o ConnectTimeout="$CONNECT_TIMEOUT" \
+                -o ServerAliveInterval=5 \
+                -o ServerAliveCountMax=1 \
                 "$alias" "$remote_cmd" 2>/dev/null); then
             echo -e "${DIM}llave${NC}     ${GREEN}${out}${NC}"
             (( fixed++ )) || true
@@ -696,12 +742,16 @@ REMOTE
 main_menu() {
     while true; do
         echo -e "\n${BOLD}  ╔══════════════════════════════════════════════════╗${NC}"
-        echo -e "${BOLD}  ║         SSH Key Manager  —  WIN + WSL            ║${NC}"
+        case "$PLATFORM" in
+            macos) echo -e "${BOLD}  ║         SSH Key Manager  —  macOS                 ║${NC}" ;;
+            wsl)   echo -e "${BOLD}  ║         SSH Key Manager  —  WIN + WSL             ║${NC}" ;;
+            *)     echo -e "${BOLD}  ║         SSH Key Manager  —  Linux                 ║${NC}" ;;
+        esac
         echo -e "${BOLD}  ╚══════════════════════════════════════════════════╝${NC}\n"
         echo -e "    ${CYAN}1)${NC}  Instalar en ${BOLD}todos${NC} los servidores  ${DIM}(${#HOSTS[@]} hosts)${NC}"
         echo -e "    ${CYAN}2)${NC}  Instalar en servidores ${BOLD}seleccionados${NC}"
         echo -e "    ${CYAN}3)${NC}  Ver lista de servidores"
-        echo -e "    ${CYAN}4)${NC}  ${BOLD}Verificar estado${NC} WIN/WSL ${DIM}(dry-run)${NC}"
+        echo -e "    ${CYAN}4)${NC}  ${BOLD}Verificar estado${NC} de llaves ${DIM}(dry-run)${NC}"
         echo -e "    ${CYAN}5)${NC}  Ver configuración activa"
         echo -e "    ${CYAN}6)${NC}  ${YELLOW}Reconfigurar${NC} ${DIM}(lanzar wizard)${NC}"
         echo -e "    ${CYAN}7)${NC}  ${BOLD}Reparar permisos SSH${NC} ${DIM}(home, ~/.ssh, dedup keys)${NC}"
@@ -762,7 +812,11 @@ main_menu() {
 clear
 echo -e "${BOLD}${CYAN}"
 echo "  ╔═══════════════════════════════════════════════════╗"
-echo "  ║     SSH Key Manager  —  Windows + WSL  v3.0      ║"
+case "$PLATFORM" in
+    macos) echo "  ║       SSH Key Manager  —  macOS  v3.1            ║" ;;
+    wsl)   echo "  ║     SSH Key Manager  —  Windows + WSL  v3.1      ║" ;;
+    *)     echo "  ║       SSH Key Manager  —  Linux  v3.1            ║" ;;
+esac
 echo "  ╚═══════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
